@@ -1,0 +1,14 @@
+{
+  "role_perms": {
+    "mute_members": [],
+    "ban_members": [],
+    "kick_members": [],
+    "warn_members": [],
+    "purge_messages": [],
+    "set_mute_role": [],
+    "set_apps_channel": [],
+    "manage_economy": [],
+    "manage_applications": [],
+    "manage_perms": []
+  }
+}
