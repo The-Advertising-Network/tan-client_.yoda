@@ -6,6 +6,7 @@ import random
 import sqlite3
 from contextlib import closing
 from typing import Optional, List, Dict
+import json
 
 # Set up a database to be used for the economy system
 class EconomyDatabase:
@@ -295,6 +296,26 @@ class ModerationDatabase:
                     })
                 return strikes
 
+    def get_warnings(self, user_id: int) -> List[Dict]:
+        """Retrieves all warnings for a given user.
+        Parameters:
+            user_id (int): The ID of the user.
+        Returns:
+        List[Dict]: A list of warnings, each represented as a dictionary.
+        """
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with closing(conn.cursor()) as cursor:
+                cursor.execute('SELECT log_id, reason, timestamp FROM warnings WHERE user_id = ?', (user_id,))
+                row = cursor.fetchall()
+                warnings = []
+                for row in row:
+                    warnings.append({
+                        'log_id': row[0],
+                        'reason': row[1],
+                        'timestamp': row[2]
+                    })
+                return warnings
+
 
 class ApplicationsDatabase:
     def __init__(self, db_path='data/applications.db'):
@@ -484,29 +505,20 @@ class ApplicationsDatabase:
                 rows = cursor.fetchall()
                 return [self._position_from_row(row) for row in rows]
 
-    def get_positions_by_name(self, name: str) -> List[Dict]:
-        """Retrieves all positions with a specific name from the database.
+    def get_position(self, name: str) -> dict | None:
+        """Retrieves a specific position by its ID or name.
         Parameters:
-            name (str): The name of the positions to be retrieved.
-        Returns:
-            list: A list of positions with the specified name, each represented as a dictionary.
-        """
-        with closing(sqlite3.connect(self.db_path)) as conn:
-            with closing(conn.cursor()) as cursor:
-                cursor.execute('SELECT * FROM positions WHERE name = ?', (name,))
-                rows = cursor.fetchall()
-                return [self._position_from_row(row) for row in rows]
-
-    def get_position(self, position_id: int) -> dict | None:
-        """Retrieves a specific position by its ID.
-        Parameters:
-            position_id (int): The ID of the position to be retrieved.
+            name (str|int): The name of the position or the numeric position_id.
         Returns:
             dict | None: The position represented as a dictionary, or None if not found.
         """
         with closing(sqlite3.connect(self.db_path)) as conn:
             with closing(conn.cursor()) as cursor:
-                cursor.execute('SELECT * FROM positions WHERE position_id = ?', (position_id,))
+                # Accept either an integer position_id or a name string
+                if isinstance(name, int):
+                    cursor.execute('SELECT * FROM positions WHERE position_id = ?', (name,))
+                else:
+                    cursor.execute('SELECT * FROM positions WHERE name = ?', (name,))
                 row = cursor.fetchone()
                 if row:
                     return self._position_from_row(row)
@@ -674,109 +686,209 @@ class ApplicationsDatabase:
                     })
                 return apps
 
-    def withdraw_application(self, application_id: int) -> bool:
-        """Mark an application as withdrawn. Returns True if a row was updated."""
+    def add_answer_to_in_progress(self, user_id: int, answer_text: str):
+        """Append an answer to the user's in-progress application.
+
+        Stores interim state in the `answers` column as JSON: {"answers": [...]}.
+        When all questions for the position are answered, marks the application as
+        'submitted' and replaces the stored JSON with a human-readable combined
+        answers string. Returns a tuple describing the result:
+
+        (True, completed: bool, application_id: int, position_id: int, next_question: str|None, final_answers: str|None)
+
+        On failure returns (False, reason_string).
+        """
         with closing(sqlite3.connect(self.db_path)) as conn:
             with closing(conn.cursor()) as cursor:
-                cursor.execute("SELECT status FROM applications WHERE application_id = ?", (application_id,))
+                cursor.execute("SELECT application_id, position_id, answers, status, submission_date FROM applications WHERE user_id = ? AND status = 'in_progress' ORDER BY application_id DESC LIMIT 1", (user_id,))
                 row = cursor.fetchone()
                 if not row:
-                    return False
-                current_status = row[0]
-                if current_status == 'withdrawn':
-                    return False
-                cursor.execute("UPDATE applications SET status = 'withdrawn' WHERE application_id = ?", (application_id,))
-                conn.commit()
-                return cursor.rowcount > 0
+                    return (False, 'no_in_progress')
+                application_id, position_id, answers_raw, status, submission_date = row
 
-    def set_application_status(self, application_id: int, status: str) -> bool:
-        """Set the status of an application (e.g., 'accepted', 'rejected'). Returns True if a row was updated."""
+                # Check expiration (24 hours since start)
+                started = self._parse_datetime(submission_date) or datetime.datetime.now()
+                if datetime.datetime.now() - started > datetime.timedelta(hours=24):
+                    # expired - remove the in-progress application
+                    cursor.execute('DELETE FROM applications WHERE application_id = ?', (application_id,))
+                    conn.commit()
+                    return (False, 'expired')
+
+                # Fetch the position questions
+                cursor.execute('SELECT questions FROM positions WHERE position_id = ?', (position_id,))
+                prow = cursor.fetchone()
+                questions = []
+                if prow and prow[0]:
+                    # stored as newline-separated questions
+                    questions = [q for q in prow[0].split('\n') if q is not None and q != '']
+
+                # Parse existing answers state (JSON) or initialize
+                state = {'answers': []}
+                if answers_raw:
+                    try:
+                        parsed = json.loads(answers_raw)
+                        if isinstance(parsed, dict) and 'answers' in parsed and isinstance(parsed['answers'], list):
+                            state = parsed
+                    except Exception:
+                        # If the stored answers are not JSON (older format), treat as fully answered
+                        # In that case, we won't append; instead signal no in-progress
+                        return (False, 'invalid_in_progress_state')
+
+                # Append the provided answer
+                state['answers'].append(answer_text)
+
+                # Determine if we've completed all questions (if no questions defined, treat single answer as complete)
+                total_questions = len(questions) if questions else 1
+                if len(state['answers']) >= total_questions:
+                    # Build a readable combined answers text pairing each question with answer
+                    combined_parts = []
+                    for idx, ans in enumerate(state['answers'], start=1):
+                        qtext = questions[idx-1] if idx-1 < len(questions) else f"Question {idx}"
+                        combined_parts.append(f"Question {idx}: {qtext}\nAnswer:\n{ans}")
+                    combined = "\n\n".join(combined_parts)
+                    now_iso = self._now_iso()
+                    cursor.execute("UPDATE applications SET answers = ?, status = 'submitted', submission_date = ? WHERE application_id = ?", (combined, now_iso, application_id))
+                    conn.commit()
+                    return (True, True, application_id, position_id, None, combined)
+
+                # Otherwise store interim JSON state and return the next question text
+                try:
+                    next_q_index = len(state['answers'])  # zero-based index for next question
+                    next_question = questions[next_q_index] if next_q_index < len(questions) else None
+                except Exception:
+                    next_question = None
+
+                cursor.execute("UPDATE applications SET answers = ? WHERE application_id = ?", (json.dumps(state), application_id))
+                conn.commit()
+                return (True, False, application_id, position_id, next_question, None)
+
+    def is_user_blacklisted(self, user_id: int) -> bool:
+        """Check if a user is blacklisted from applying.
+        Parameters:
+            user_id (int): The ID of the user to check.
+        Returns:
+            bool: True if the user is blacklisted, False otherwise.
+        """
         with closing(sqlite3.connect(self.db_path)) as conn:
             with closing(conn.cursor()) as cursor:
-                cursor.execute("SELECT status FROM applications WHERE application_id = ?", (application_id,))
+                cursor.execute('SELECT 1 FROM application_blacklist WHERE user_id = ?', (user_id,))
                 row = cursor.fetchone()
-                if not row:
-                    return False
-                current_status = row[0]
-                if current_status == status:
-                    # No change needed
-                    return False
-                cursor.execute("UPDATE applications SET status = ? WHERE application_id = ?", (status, application_id))
-                conn.commit()
-                return cursor.rowcount > 0
+                return row is not None
 
-    # --- New: flagging helpers for applications ---
-    def flag_user(self, user_id: int, flagged_by: int, reason: str | None = None, guild_id: int | None = None) -> None:
-        """Flag a user so staff will be auto-pinged when they apply again. If a flag exists it will be replaced/updated."""
-        now_iso = self._now_iso()
+    # -- New helper methods expected by the applications cog --
+    def is_user_flagged(self, user_id: int, guild_id: int | None = None) -> bool:
+        """Return True if the user is flagged (optionally scoped to a guild)."""
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with closing(conn.cursor()) as cursor:
+                if guild_id is None:
+                    cursor.execute('SELECT 1 FROM application_flags WHERE user_id = ?', (user_id,))
+                else:
+                    cursor.execute('SELECT 1 FROM application_flags WHERE user_id = ? AND (guild_id IS NULL OR guild_id = ?)', (user_id, guild_id))
+                return cursor.fetchone() is not None
+
+    def flag_user(self, user_id: int, flagged_by: int | None = None, reason: str | None = None, guild_id: int | None = None) -> None:
+        """Flag a user to auto-ping staff when they re-apply. Overwrites existing flag for the user."""
+        now = datetime.datetime.now().isoformat()
         with closing(sqlite3.connect(self.db_path)) as conn:
             with closing(conn.cursor()) as cursor:
                 cursor.execute('''
                     INSERT INTO application_flags (user_id, flagged_by, reason, flagged_at, guild_id)
                     VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(user_id) DO UPDATE SET flagged_by=excluded.flagged_by, reason=excluded.reason, flagged_at=excluded.flagged_at, guild_id=excluded.guild_id
-                ''', (user_id, flagged_by, reason, now_iso, guild_id))
+                    ON CONFLICT(user_id) DO UPDATE SET flagged_by = excluded.flagged_by, reason = excluded.reason, flagged_at = excluded.flagged_at, guild_id = excluded.guild_id
+                ''', (user_id, flagged_by, reason, now, guild_id))
                 conn.commit()
 
     def unflag_user(self, user_id: int) -> bool:
-        """Remove a flag for a user. Returns True if a row was removed."""
+        """Remove a user's application flag. Returns True if a row was removed."""
         with closing(sqlite3.connect(self.db_path)) as conn:
             with closing(conn.cursor()) as cursor:
                 cursor.execute('DELETE FROM application_flags WHERE user_id = ?', (user_id,))
                 conn.commit()
                 return cursor.rowcount > 0
 
-    def is_user_flagged(self, user_id: int, guild_id: int | None = None) -> bool:
-        """Return True if the user is flagged. If guild_id is provided, returns True for either a guild-scoped flag or a global (NULL) flag."""
-        with closing(sqlite3.connect(self.db_path)) as conn:
-            with closing(conn.cursor()) as cursor:
-                if guild_id is None:
-                    cursor.execute('SELECT 1 FROM application_flags WHERE user_id = ? LIMIT 1', (user_id,))
-                else:
-                    cursor.execute('SELECT 1 FROM application_flags WHERE user_id = ? AND (guild_id IS NULL OR guild_id = ?) LIMIT 1', (user_id, guild_id))
-                row = cursor.fetchone()
-                return bool(row)
-
-    def get_flag(self, user_id: int) -> dict | None:
-        """Return the flag row for a user, or None if not flagged."""
-        with closing(sqlite3.connect(self.db_path)) as conn:
-            with closing(conn.cursor()) as cursor:
-                cursor.execute('SELECT user_id, flagged_by, reason, flagged_at, guild_id FROM application_flags WHERE user_id = ?', (user_id,))
-                row = cursor.fetchone()
-                if not row:
-                    return None
-                return {
-                    'user_id': row[0],
-                    'flagged_by': row[1],
-                    'reason': row[2],
-                    'flagged_at': row[3],
-                    'guild_id': row[4]
-                }
-
-    def blacklist_user(self, user_id: int, blacklisted_by: int, reason: str | None = None) -> None:
-        """Blacklist a user from applying. If already blacklisted, updates the entry."""
-        now_iso = self._now_iso()
+    def blacklist_user(self, user_id: int, blacklisted_by: int | None = None, reason: str | None = None) -> None:
+        """Blacklist a user from submitting applications. Overwrites any existing blacklist entry."""
+        now = datetime.datetime.now().isoformat()
         with closing(sqlite3.connect(self.db_path)) as conn:
             with closing(conn.cursor()) as cursor:
                 cursor.execute('''
                     INSERT INTO application_blacklist (user_id, blacklisted_by, reason, blacklisted_at)
                     VALUES (?, ?, ?, ?)
-                    ON CONFLICT(user_id) DO UPDATE SET blacklisted_by=excluded.blacklisted_by, reason=excluded.reason, blacklisted_at=excluded.blacklisted_at
-                ''', (user_id, blacklisted_by, reason, now_iso))
+                    ON CONFLICT(user_id) DO UPDATE SET blacklisted_by = excluded.blacklisted_by, reason = excluded.reason, blacklisted_at = excluded.blacklisted_at
+                ''', (user_id, blacklisted_by, reason, now))
                 conn.commit()
 
     def unblacklist_user(self, user_id: int) -> bool:
-        """Remove a user from the blacklist. Returns True if a row was removed."""
+        """Remove a user's blacklist status. Returns True if a row was removed."""
         with closing(sqlite3.connect(self.db_path)) as conn:
             with closing(conn.cursor()) as cursor:
                 cursor.execute('DELETE FROM application_blacklist WHERE user_id = ?', (user_id,))
                 conn.commit()
                 return cursor.rowcount > 0
 
-    def is_user_blacklisted(self, user_id: int) -> bool:
-        """Return True if the user is blacklisted."""
+    def withdraw_application(self, application_id: int) -> bool:
+        """Mark an application as withdrawn. Returns True if updated."""
         with closing(sqlite3.connect(self.db_path)) as conn:
             with closing(conn.cursor()) as cursor:
-                cursor.execute('SELECT 1 FROM application_blacklist WHERE user_id = ? LIMIT 1', (user_id,))
+                # Only change if the application exists and is not already final
+                cursor.execute('SELECT status FROM applications WHERE application_id = ?', (application_id,))
                 row = cursor.fetchone()
-                return bool(row)
+                if not row:
+                    return False
+                current = row[0]
+                if current in ('withdrawn', 'accepted', 'rejected'):
+                    return False
+                cursor.execute("UPDATE applications SET status = 'withdrawn' WHERE application_id = ?", (application_id,))
+                conn.commit()
+                return cursor.rowcount > 0
+
+    def set_application_status(self, application_id: int, status: str) -> bool:
+        """Set an application's status. Returns True if the row was updated."""
+        # Basic validation of status
+        allowed = {'pending', 'under_review', 'accepted', 'rejected', 'withdrawn', 'flagged', 'on_hold', 'submitted'}
+        if status not in allowed:
+            return False
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with closing(conn.cursor()) as cursor:
+                cursor.execute('SELECT status FROM applications WHERE application_id = ?', (application_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return False
+                if row[0] == status:
+                    return False
+                cursor.execute('UPDATE applications SET status = ? WHERE application_id = ?', (status, application_id))
+                conn.commit()
+                return cursor.rowcount > 0
+
+    def is_valid_database(self, path: str) -> tuple[bool, str | None]:
+        """Quickly validate that a given sqlite file contains the expected tables and columns for the applications DB.
+        Returns (True, None) on success or (False, reason) on failure."""
+        try:
+            with closing(sqlite3.connect(path)) as conn:
+                with closing(conn.cursor()) as cursor:
+                    # Check required tables
+                    required_tables = {
+                        'positions': {'position_id', 'name', 'description', 'roles_given', 'questions', 'acceptance_message', 'rejection_message', 'open'},
+                        'applications': {'application_id', 'user_id', 'position_id', 'answers', 'status', 'submission_date'},
+                        'applications_channel': {'guild_id', 'channel_id'},
+                        'application_flags': {'user_id', 'flagged_by', 'reason', 'flagged_at', 'guild_id'},
+                        'application_blacklist': {'user_id', 'blacklisted_by', 'reason', 'blacklisted_at'}
+                    }
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                    tables = {r[0] for r in cursor.fetchall()}
+                    missing = set(required_tables.keys()) - tables
+                    if missing:
+                        return (False, f"Missing tables: {', '.join(sorted(missing))}")
+
+                    # Check columns for each required table
+                    for t, cols in required_tables.items():
+                        cursor.execute(f"PRAGMA table_info({t})")
+                        existing_cols = {r[1] for r in cursor.fetchall()}
+                        missing_cols = cols - existing_cols
+                        if missing_cols:
+                            return (False, f"Table '{t}' missing columns: {', '.join(sorted(missing_cols))}")
+            return (True, None)
+        except sqlite3.DatabaseError as e:
+            return (False, f"Not a valid sqlite database: {e}")
+        except Exception as e:
+            return (False, str(e))
