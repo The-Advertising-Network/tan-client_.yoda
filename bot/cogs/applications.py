@@ -1,7 +1,9 @@
 #######################################################
-# Moderation Cog - Provides moderation-related commands for the bot
+# Applications Cog - Provides applications-related commands for the bot
 #######################################################
+import tempfile, os, time
 import discord
+import json
 from discord.ext import commands
 
 # Import database and permission utilities with robust fallbacks using dynamic import
@@ -30,14 +32,15 @@ class Applications(commands.Cog):
     # DM listener to handle app responses
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """Listen for DMs from users applying for positions and submit the next message as their application.
+        """Listen for DMs from users applying for positions and handle per-question answers.
 
         Behavior:
         - Only handles direct messages (DMChannel) from non-bot users.
         - Checks for an in-progress application for the user (started via /apply).
-        - The first message from the user in DMs after starting (and only that message) is submitted as their application answers.
-        - The application must be submitted within 24 hours (enforced by the DB submit_application method).
-        - The bot posts the submission into the configured applications channel for the server the bot is in.
+        - Each message from the user in DMs is treated as the next answer. The bot
+          will send the next question (if any) after receiving an answer, or submit
+          when all questions are answered.
+        - The application must be submitted within 24 hours (enforced by the DB methods).
         """
         # Ignore non-DMs and bot messages
         if not isinstance(message.channel, discord.DMChannel):
@@ -50,46 +53,112 @@ class Applications(commands.Cog):
         if not in_progress:
             return  # nothing to do
 
-        # Only accept a single message: submit and stop
+        # Build answer text from message content and attachments
         answers = message.content or ""
-        # Include attachments' URLs if present
         if message.attachments:
             attachments_text = "\n\nAttachments:\n" + "\n".join(a.url for a in message.attachments)
             answers = (answers + attachments_text).strip()
 
-        submitted = self.db.submit_application(message.author.id, answers)
-        if not submitted[0]:
+        # Append answer to in-progress application using new DB helper
+        res = self.db.add_answer_to_in_progress(message.author.id, answers)
+        if not res or not res[0]:
             # Failure -- determine reason
-            reason = submitted[1]
+            reason = res[1] if isinstance(res, tuple) and len(res) > 1 else 'unknown'
             if reason == 'no_in_progress':
                 try:
-                    await message.channel.send("You don't have an in-progress application. Start one with `/application apply <position_id>` in the server.")
+                    embed = discord.Embed(
+                        title="No In-Progress Application",
+                        description="You don't have an in-progress application. Start one with `/application apply <position_name>` in the server.",
+                        colour=discord.Color.orange()
+                    )
+                    await message.channel.send(embed=embed)
                 except discord.Forbidden:
                     pass
                 return
-            if reason == 'expired':
+            if reason == 'invalid_in_progress_state':
                 try:
-                    await message.channel.send("Your application has expired (more than 24 hours since you started). Please start again with `/application apply <position_id>`.")
+                    embed = discord.Embed(
+                        title="Application Error",
+                        description="Your in-progress application is in an unexpected state. Please contact staff.",
+                        colour=discord.Color.red()
+                    )
+                    await message.channel.send(embed=embed)
                 except discord.Forbidden:
                     pass
                 return
             # Generic failure
             try:
-                await message.channel.send("Failed to submit your application. Please contact staff.")
+                embed = discord.Embed(
+                    title="Failed to Record Answer",
+                    description="Failed to record your answer. Please contact staff.",
+                    colour=discord.Color.red()
+                )
+                await message.channel.send(embed=embed)
             except discord.Forbidden:
                 pass
             return
 
-        # On success, submitted is (True, application_id, position_id)
-        _, application_id, position_id = submitted
+        # res is (True, completed, application_id, position_id, next_question, final_answers)
+        _, completed, application_id, position_id, next_question, final_answers = res
 
+        # If not completed, send the next question or a confirmation
+        if not completed:
+            if next_question:
+                # Compute which question number we're on by inspecting the stored in-progress answers
+                try:
+                    in_prog = self.db.get_in_progress_application(message.author.id)
+                    answered_count = 0
+                    if in_prog and in_prog.get('answers'):
+                        raw = in_prog.get('answers')
+                        try:
+                            parsed = json.loads(raw)
+                            if isinstance(parsed, dict) and isinstance(parsed.get('answers'), list):
+                                answered_count = len(parsed.get('answers'))
+                        except Exception:
+                            # If not JSON, fallback to treating as a single answered blob
+                            answered_count = 1
+                    question_num = answered_count + 1
+                except Exception:
+                    question_num = None
+
+                # Send a single embed that includes the question number (if available) and the question text
+                try:
+                    q_title = f"Question {question_num}" if question_num else "Next Question"
+                    q_embed = discord.Embed(
+                        title=q_title,
+                        description=next_question,
+                        colour=discord.Color.blue()
+                    )
+                    await message.channel.send(embed=q_embed)
+                except discord.Forbidden:
+                    pass
+                return
+            else:
+                # No next question found (shouldn't happen) - tell user to wait
+                try:
+                    embed = discord.Embed(
+                        title="Answer Recorded",
+                        description="Recorded your answer. Awaiting next question (if any).",
+                        colour=discord.Color.blue()
+                    )
+                    await message.channel.send(embed=embed)
+                except discord.Forbidden:
+                    pass
+                return
+
+        # Completed submission - notify staff channel and user
         # Find the guild (this bot is intended for a single server)
         guild = None
         if self.bot.guilds:
             guild = self.bot.guilds[0]
         if not guild:
             try:
-                await message.channel.send("Submission saved, but I couldn't find the server to post it to. Contact staff.")
+                embed = discord.Embed(
+                    title="Submission Received",
+                    description="Your application has been submitted, but I couldn't find the server to post it to. Please contact staff.",
+                    colour=discord.Color.orange()
+                )
+                await message.channel.send(embed=embed)
             except discord.Forbidden:
                 pass
             return
@@ -98,7 +167,12 @@ class Applications(commands.Cog):
         channel_id = self.db.get_applications_channel(guild.id)
         if not channel_id:
             try:
-                await message.channel.send("Submission saved, but no applications channel is configured. Please ping a management member.")
+                embed = discord.Embed(
+                    title="Submission Received",
+                    description="Your application has been submitted, but no applications channel is configured. Please contact staff.",
+                    colour=discord.Color.orange()
+                )
+                await message.channel.send(embed=embed)
             except discord.Forbidden:
                 pass
             return
@@ -106,7 +180,12 @@ class Applications(commands.Cog):
         channel = guild.get_channel(channel_id)
         if not channel:
             try:
-                await message.channel.send(f"Submission saved, but the configured applications channel (ID {channel_id}) could not be found in the server. Please ping a management member.")
+                embed = discord.Embed(
+                    title="Submission Received",
+                    description=f"Your application has been submitted, but the configured applications channel (ID {channel_id}) could not be found in the server. Please ping a management member.",
+                    colour=discord.Color.orange()
+                )
+                await message.channel.send(embed=embed)
             except discord.Forbidden:
                 pass
             return
@@ -118,7 +197,7 @@ class Applications(commands.Cog):
         embed.add_field(name="Applicant", value=f"{message.author} (ID: {message.author.id})", inline=False)
         embed.add_field(name="Application ID", value=str(application_id), inline=True)
         embed.add_field(name="Position ID", value=str(position_id), inline=True)
-        truncated = (answers[:1900] + '...') if len(answers) > 1900 else answers or "(No content)"
+        truncated = (final_answers[:1900] + '...') if final_answers and len(final_answers) > 1900 else (final_answers or "(No content)")
         embed.add_field(name="Answers", value=truncated, inline=False)
         embed.set_footer(text="Use your normal review workflow to accept/reject and assign roles.")
 
@@ -153,14 +232,24 @@ class Applications(commands.Cog):
                 await channel.send(content=mention_text)
             await channel.send(embed=embed)
             try:
-                await message.channel.send("Your application has been submitted to staff for review. Thank you!")
+                confirm_embed = discord.Embed(
+                    title="Application Submitted",
+                    description="Your application has been submitted to staff for review. Thank you!",
+                    colour=discord.Color.green()
+                )
+                await message.channel.send(embed=confirm_embed)
             except discord.Forbidden:
                 pass
         except discord.Forbidden:
             pass
         except Exception as e:
             try:
-                await message.channel.send("An error occurred while submitting your application. Please contact staff.")
+                embed = discord.Embed(
+                    title="Submission Failed",
+                    description="An error occurred while submitting your application. Please contact staff.",
+                    colour=discord.Color.red()
+                )
+                await message.channel.send(embed=embed)
             except discord.Forbidden:
                 pass
 
@@ -204,7 +293,7 @@ class Applications(commands.Cog):
         )
         for pos in page_positions:
             embed.add_field(
-                name=f"ID {pos['position_id']}: {pos['name']}",
+                name=f"{pos['name'].title()}",
                 value=f"Description: {pos.get('description', 'No description provided.')}",
                 inline=False
             )
@@ -213,8 +302,13 @@ class Applications(commands.Cog):
         await ctx.respond(embed=embed)
 
     @application_commands.command(name="apply", description="Apply for an application position.")
-    async def apply(self, ctx: discord.ApplicationContext, position_id: int):
-        """Apply for an application position."""
+    async def apply(self, ctx: discord.ApplicationContext, position_name: str):
+        """Apply for an application position by name.
+
+        This starts an in-progress application and sends the first question as a DM
+        (rather than all questions at once). The user's subsequent DM messages will
+        be treated as answers to each question in turn.
+        """
         if self.db.is_user_blacklisted(ctx.author.id):
             embed = discord.Embed(
                 title="Application Denied",
@@ -224,11 +318,13 @@ class Applications(commands.Cog):
             await ctx.respond(embed=embed, ephemeral=True)
             return
 
-        position = self.db.get_position(position_id)
+        # Normalize and look up by name (positions are stored lowercased by create)
+        lookup_name = position_name.lower()
+        position = self.db.get_position(lookup_name)
         if not position:
             embed = discord.Embed(
                 title="Position Not Found",
-                description=f"No application position found with ID {position_id}. Use `/application list` to see available positions.",
+                description=f"No application position found with the name '{position_name}'. Use `/application list` to see available positions.",
                 colour=discord.Color.red()
             )
             await ctx.respond(embed=embed, ephemeral=True)
@@ -237,26 +333,55 @@ class Applications(commands.Cog):
         if not position.get('open', False):
             embed = discord.Embed(
                 title="Application Closed",
-                description=f"The application position '{position['name']}' (ID: {position_id}) is currently closed for submissions.",
+                description=f"The application position '{position['name']}' (ID: {position['position_id']}) is currently closed for submissions.",
                 colour=discord.Color.orange()
             )
             await ctx.respond(embed=embed, ephemeral=True)
             return
 
-        # Start application process
-        dm_embed = discord.Embed(
-            title=f"Application for '{position['name']}'",
-            description="You have initiated the application process. Please answer the following questions:",
-            colour=discord.Color.blue()
-        )
-        questions = position.get('questions', [])
-        if not questions:
-            dm_embed.add_field(name="No Questions", value="There are no questions for this application. Please wait for further instructions from the staff.", inline=False)
-        else:
-            for idx, question in enumerate(questions, start=1):
-                dm_embed.add_field(name=f"Question {idx}", value=question, inline=False)
+        # Start application process and send the first question only
         try:
-            await ctx.author.send(embed=dm_embed)
+            # Start the in-progress application using the resolved position_id
+            app_id = self.db.start_application(user_id=ctx.author.id, position_id=position['position_id'])
+            questions = position.get('questions', [])
+            if not questions:
+                # If there are no questions, inform the user and leave in-progress as empty; they can send a message to submit
+                try:
+                    await ctx.author.send(embed=discord.Embed(title=f"Application for '{position['name']}'", description="There are no questions for this application. Please send any additional information you want staff to see, or wait for staff to contact you.", colour=discord.Color.blue()))
+                except discord.Forbidden:
+                    embed = discord.Embed(
+                        title="DM Failed",
+                        description="I was unable to send you a DM. Please ensure your privacy settings allow DMs from server members and try again.",
+                        colour=discord.Color.red()
+                    )
+                    await ctx.respond(embed=embed, ephemeral=True)
+                    return
+            else:
+                # Send only the first question
+                first_q = questions[0]
+                dm_embed = discord.Embed(
+                    title=f"Application for '{position['name']}'",
+                    description="You have initiated the application process. Please answer the following question. Reply in this DM with your answer; the bot will send the next question.",
+                    colour=discord.Color.blue()
+                )
+                dm_embed.add_field(name="Question 1", value=first_q, inline=False)
+                try:
+                    await ctx.author.send(embed=dm_embed)
+                except discord.Forbidden:
+                    embed = discord.Embed(
+                        title="DM Failed",
+                        description="I was unable to send you a DM. Please ensure your privacy settings allow DMs from server members and try again.",
+                        colour=discord.Color.red()
+                    )
+                    await ctx.respond(embed=embed, ephemeral=True)
+                    return
+
+            embed = discord.Embed(
+                title="Application Process Started",
+                description=(f"You have started the application process for '{position['name'].title()}'. Please check your DMs and reply with your answer to Question 1 — the bot will send the next question. You have 24 hours to complete the application."),
+                colour=discord.Color.green()
+            )
+            await ctx.respond(embed=embed, ephemeral=True)
         except discord.Forbidden:
             embed = discord.Embed(
                 title="DM Failed",
@@ -265,15 +390,6 @@ class Applications(commands.Cog):
             )
             await ctx.respond(embed=embed, ephemeral=True)
             return
-
-        # Start an in-progress application (stores timestamp). The next DM from the user is treated as the submission.
-        self.db.start_application(user_id=ctx.author.id, position_id=position_id)
-        embed = discord.Embed(
-            title="Application Process Started",
-            description=f"You have started the application process for '{position['name']}' (ID: {position_id}). Please check your DMs and reply with your answers — the next message you send will be submitted. You have 24 hours to submit.",
-            colour=discord.Color.green()
-        )
-        await ctx.respond(embed=embed, ephemeral=True)
 
     @application_commands.command(name="withdraw", description="Withdraw your submitted application.")
     async def withdraw(self, ctx: discord.ApplicationContext, application_id: int = None):
@@ -372,6 +488,126 @@ class Applications(commands.Cog):
 
     # Application management commands
 
+    @perms_util.has_permission("manage_applications")
+    @appsmanage_commands.command(name="get_file", description="Provides a copy of the applications database file.")
+    async def get_file(self, ctx: discord.ApplicationContext):
+        """Provides a copy of the applications database file."""
+        db_path = self.db.db_path
+        try:
+            await ctx.respond("Here is the applications database file:", file=discord.File(db_path))
+        except Exception as e:
+            embed = discord.Embed(
+                title="Failed to Send Database",
+                description=f"An error occurred while sending the database file: {e}",
+                colour=discord.Color.red()
+            )
+            await ctx.respond(embed=embed)
+
+    @perms_util.has_permission("manage_applications")
+    @appsmanage_commands.command(name="put_file", description="Replace the applications database with an uploaded file.")
+    async def put_file(self, ctx: discord.ApplicationContext, file: discord.Attachment):
+        """Replace the applications database with an uploaded file."""
+        if not file.filename.endswith('.db'):
+            embed = discord.Embed(
+                title="Invalid File",
+                description="The uploaded file must be a .db file.",
+                colour=discord.Color.red()
+            )
+            await ctx.respond(embed=embed)
+            return
+
+        try:
+            # Download the file into a temporary path first
+            file_bytes = await file.read()
+            tmp_dir = tempfile.gettempdir()
+            tmp_path = os.path.join(tmp_dir, f"uploaded_applications_{int(time.time())}.db")
+            with open(tmp_path, 'wb') as f:
+                f.write(file_bytes)
+
+            # Validate schema before replacing the live database
+            valid, reason = self.db.is_valid_database(tmp_path)
+            if not valid:
+                # Remove temp file and report
+                try:
+                    os.remove(tmp_path)
+                except Exception as e:
+                    print("Warning: failed to remove temporary uploaded database file.", e)
+                embed = discord.Embed(
+                    title="Invalid Database",
+                    description=f"The uploaded database does not match the required schema: {reason}",
+                    colour=discord.Color.red()
+                )
+                await ctx.respond(embed=embed)
+                return
+
+            # Replace the live database file. Try atomic replace first; if that
+            # fails due to cross-device move (EXDEV on POSIX or WinError 17 on
+            # Windows) fall back to copying the file.
+            try:
+                backup_path = self.db.db_path + '.bak'
+                try:
+                    if os.path.exists(self.db.db_path):
+                        os.replace(self.db.db_path, backup_path)
+                except Exception as e:
+                    # best-effort; ignore backup failures
+                    print("Warning: failed to backup temporary database file.", e)
+
+                try:
+                    # Attempt atomic replace
+                    os.replace(tmp_path, self.db.db_path)
+                except OSError as e_replace:
+                    # Detect cross-device / different-filesystem error and fallback
+                    import errno, shutil
+                    is_exdev = False
+                    if hasattr(e_replace, 'errno') and e_replace.errno == errno.EXDEV:
+                        is_exdev = True
+                    if hasattr(e_replace, 'winerror') and getattr(e_replace, 'winerror') == 17:
+                        is_exdev = True
+
+                    if is_exdev:
+                        try:
+                            shutil.copy2(tmp_path, self.db.db_path)
+                            # remove the tmp file now it's copied
+                            try:
+                                os.remove(tmp_path)
+                            except Exception as e_remove:
+                                print("Warning: failed to remove temporary uploaded database file after copy.", e_remove)
+                        except Exception as e_copy:
+                            # Attempt to restore backup if copy failed
+                            try:
+                                if os.path.exists(backup_path):
+                                    os.replace(backup_path, self.db.db_path)
+                            except Exception as e_restore:
+                                print("Warning: failed to restore database from backup after failed copy.", e_restore)
+                            raise e_copy from e_replace
+                    else:
+                        # Not a cross-device error - re-raise to be handled below
+                        raise
+            except Exception as e:
+                print("Error replacing database file:", e)
+                embed = discord.Embed(
+                    title="Failed to Replace Database",
+                    description=f"An error occurred while replacing the database file: {e}",
+                    colour=discord.Color.red()
+                )
+                await ctx.respond(embed=embed)
+                return
+
+            embed = discord.Embed(
+                title="Database Replaced",
+                description="The applications database has been successfully replaced with the uploaded file.",
+                colour=discord.Color.green()
+            )
+            await ctx.respond(embed=embed)
+        except Exception as e:
+            print("Error processing uploaded database file:", e)
+            embed = discord.Embed(
+                title="Failed to Replace Database",
+                description=f"An error occurred while replacing the database file: {e}",
+                colour=discord.Color.red()
+            )
+            await ctx.respond(embed=embed)
+
     @perms_util.has_permission("set_apps_channel")
     @appsmanage_commands.command(name="set_apps_channel", description="Set the channel for application submissions.")
     async def set_apps_channel(self, ctx: discord.ApplicationContext, channel: discord.TextChannel):
@@ -416,37 +652,55 @@ class Applications(commands.Cog):
     async def create(self, ctx: discord.ApplicationContext, application_name: str):
         """Create a new application position.
         Allows identical names, but it's not recommended."""
+        # Enforce unique position names (case-insensitive).
         application_name = application_name.lower()
-        position_id = self.db.add_position(application_name) # Add position to database and get its ID
+        existing_positions = self.db.get_position(application_name)
+        if existing_positions:
+            embed = discord.Embed(
+                title="Creation Failed",
+                description=f"An application position with the name '{application_name}' already exists. Choose a unique name.",
+                colour=discord.Color.red()
+            )
+            await ctx.respond(embed=embed, ephemeral=True)
+            return
+
+        # Add position to database and get its ID
+        position_id = self.db.add_position(application_name)
         embed = discord.Embed(
             title="Application Created",
             description=f"Application position '{application_name}' created with ID {position_id}.",
             colour=discord.Color.green()
         )
-        # Check if another position with this name already exists, and warn if so
-        existing_positions = self.db.get_positions_by_name(application_name)
-        if len(existing_positions) > 1:
-            embed.add_field(
-                name="Warning: Duplicate Names",
-                value=f"There are multiple application positions with the name '{application_name}'. Consider using unique names to avoid confusion.",
-                inline=False
-            )
-            embed.colour = discord.Color.orange()
         await ctx.respond(embed=embed)
 
     @perms_util.has_permission("manage_roles")
     @appsmanage_commands.command(name="delete", description="Delete an existing application position.")
-    async def delete(self, ctx: discord.ApplicationContext, position_id: int):
-        """Delete an existing application position."""
-        position = self.db.get_position(position_id)
-        if not position:
+    async def delete(self, ctx: discord.ApplicationContext, application_name: str):
+        """Delete an existing application position by name. If multiple positions share the name, the command will ask you to disambiguate by ID."""
+        lookup_name = application_name.lower()
+        positions = self.db.get_position(lookup_name)
+        if not positions:
             embed = discord.Embed(
                 title="Position Not Found",
-                description=f"No application position found with ID {position_id}.",
+                description=f"No application position found with the name '{application_name}'.",
                 colour=discord.Color.red()
             )
             await ctx.respond(embed=embed)
             return
+
+        if len(positions) > 1:
+            # Ambiguous — ask the invoker to use the ID to delete
+            duplicate_list = '\n'.join([f"ID {p['position_id']} — {p['name']}" for p in positions])
+            embed = discord.Embed(
+                title="Multiple Positions Found",
+                description=(f"Multiple positions match the name '{application_name}'. Please re-run this command using the position's ID to delete the intended one.\n\n{duplicate_list}"),
+                colour=discord.Color.orange()
+            )
+            await ctx.respond(embed=embed)
+            return
+
+        position = positions[0]
+        position_id = position['position_id']
 
         self.db.remove_position(position_id)
         embed = discord.Embed(
@@ -456,293 +710,6 @@ class Applications(commands.Cog):
         )
         await ctx.respond(embed=embed)
 
-    @perms_util.has_permission("manage_applications")
-    @appsmanage_commands.command(name="open", description="Open an application position for submissions.")
-    async def open_position(self, ctx: discord.ApplicationContext, position_id: int):
-        """Open an application position for submissions."""
-        position = self.db.get_position(position_id)
-        if not position:
-            embed = discord.Embed(
-                title="Position Not Found",
-                description=f"No application position found with ID {position_id}.",
-                colour=discord.Color.red()
-            )
-            await ctx.respond(embed=embed)
-            return
-
-        self.db.set_position_open(position_id, True)
-        embed = discord.Embed(
-            title="Application Opened",
-            description=f"Application position '{position['name']}' (ID: {position_id}) is now open for submissions.",
-            colour=discord.Color.green()
-        )
-        await ctx.respond(embed=embed)
-
-    @perms_util.has_permission("manage_applications")
-    @appsmanage_commands.command(name="close", description="Close an application position for submissions.")
-    async def close_position(self, ctx: discord.ApplicationContext, position_id: int):
-        """Close an application position for submissions."""
-        position = self.db.get_position(position_id)
-        if not position:
-            embed = discord.Embed(
-                title="Position Not Found",
-                description=f"No application position found with ID {position_id}.",
-                colour=discord.Color.red()
-            )
-            await ctx.respond(embed=embed)
-            return
-
-        self.db.set_position_open(position_id, False)
-        embed = discord.Embed(
-            title="Application Closed",
-            description=f"Application position '{position['name']}' (ID: {position_id}) is now closed for submissions.",
-            colour=discord.Color.green()
-        )
-        await ctx.respond(embed=embed)
-
-    @perms_util.has_permission("manage_applications")
-    @appsmanage_commands.command(name="view", description="View details of an application position.")
-    async def view_position(self, ctx: discord.ApplicationContext, position_id: int):
-        """View details of an application position."""
-        position = self.db.get_position(position_id)
-        if not position:
-            embed = discord.Embed(
-                title="Position Not Found",
-                description=f"No application position found with ID {position_id}.",
-                colour=discord.Color.red()
-            )
-            await ctx.respond(embed=embed)
-            return
-
-        embed = discord.Embed(
-            title=f"Application Position: {position['name']}",
-            colour=discord.Color.blue()
-        )
-        embed.add_field(name="ID", value=str(position['position_id']), inline=False)
-        embed.add_field(name="Description", value=position.get('description', 'No description provided.'), inline=False)
-        embed.add_field(name="Roles Given", value=", ".join([f"<@&{role_id}>" for role_id in position.get('roles_given', [])]) or "None", inline=False)
-        embed.add_field(name="Questions", value="\n".join(position.get('questions', [])) or "None", inline=False)
-        embed.add_field(name="Acceptance Message", value=position.get('acceptance_message', 'None'), inline=False)
-        embed.add_field(name="Rejection Message", value=position.get('rejection_message', 'None'), inline=False)
-        embed.add_field(name="Open for Submissions", value="Yes" if position.get('open', False) else "No", inline=False)
-
-        await ctx.respond(embed=embed)
-
-    @perms_util.has_permission("manage_applications")
-    @appsmanage_commands.command(name="set_description", description="Set the description for an application position.")
-    async def set_description(self, ctx: discord.ApplicationContext, position_id: int, *, description: str):
-        """Set the description for an application position."""
-        position = self.db.get_position(position_id)
-        if not position:
-            embed = discord.Embed(
-                title="Position Not Found",
-                description=f"No application position found with ID {position_id}.",
-                colour=discord.Color.red()
-            )
-            await ctx.respond(embed=embed)
-            return
-
-        self.db.modify(position_id, "description", description)
-        embed = discord.Embed(
-            title="Description Updated",
-            description=f"Description for application position '{position['name']}' (ID: {position_id}) has been updated.",
-            colour=discord.Color.green()
-        )
-        embed.add_field(name="Description (old)", value=position.get('description', 'No description provided.'), inline=False)
-        embed.add_field(name="Description (new)", value=description, inline=False)
-        await ctx.respond(embed=embed)
-
-    @perms_util.has_permission("manage_applications")
-    @appsmanage_commands.command(name="add_question", description="Add a question to an application position.")
-    async def add_question(self, ctx: discord.ApplicationContext, position_id: int, *, question: str):
-        """Add a question to an application position."""
-        position = self.db.get_position(position_id)
-        if not position:
-            embed = discord.Embed(
-                title="Position Not Found",
-                description=f"No application position found with ID {position_id}.",
-                colour=discord.Color.red()
-            )
-            await ctx.respond(embed=embed)
-            return
-
-        questions = position.get('questions', [])
-        questions.append(question)
-        self.db.modify(position_id, "questions", questions)
-        embed = discord.Embed(
-            title="Question Added",
-            description=f"Question added to application position '{position['name']}' (ID: {position_id}).",
-            colour=discord.Color.green()
-        )
-        embed.add_field(name="New Question", value=question, inline=False)
-        await ctx.respond(embed=embed)
-
-    @perms_util.has_permission("manage_applications")
-    @appsmanage_commands.command(name="remove_question", description="Remove a question from an application position.")
-    async def remove_question(self, ctx: discord.ApplicationContext, position_id: int, question_index: int):
-        """Remove a question from an application position by its index (1-based)."""
-        position = self.db.get_position(position_id)
-        if not position:
-            embed = discord.Embed(
-                title="Position Not Found",
-                description=f"No application position found with ID {position_id}.",
-                colour=discord.Color.red()
-            )
-            await ctx.respond(embed=embed)
-            return
-
-        questions = position.get('questions', [])
-        if question_index < 1 or question_index > len(questions):
-            embed = discord.Embed(
-                title="Invalid Question Index",
-                description=f"Question index {question_index} is out of range. There are {len(questions)} question(s) available.",
-                colour=discord.Color.red()
-            )
-            await ctx.respond(embed=embed)
-            return
-
-        removed_question = questions.pop(question_index - 1)
-        self.db.modify(position_id, "questions", questions)
-        embed = discord.Embed(
-            title="Question Removed",
-            description=f"Question removed from application position '{position['name']}' (ID: {position_id}).",
-            colour=discord.Color.green()
-        )
-        embed.add_field(name="Removed Question", value=removed_question, inline=False)
-        await ctx.respond(embed=embed)
-
-    @perms_util.has_permission("manage_applications")
-    @appsmanage_commands.command(name="set_roles", description="Set the roles to be given upon acceptance for an application position.")
-    async def set_roles(self, ctx: discord.ApplicationContext, position_id: int, *, roles: str = ""):
-        """Set the roles (by mention, ID or name) to be given upon acceptance for an application position.
-
-        Roles should be provided as a space- or comma-separated list. Example:
-        `/appsmanage set_roles 1 @Role1 @Role2` or `/appsmanage set_roles 1 123456789012345678,987654321098765432`
-        Passing no roles will clear the roles for the position.
-        """
-        position = self.db.get_position(position_id)
-        if not position:
-            embed = discord.Embed(
-                title="Position Not Found",
-                description=f"No application position found with ID {position_id}.",
-                colour=discord.Color.red()
-            )
-            await ctx.respond(embed=embed)
-            return
-
-        # If empty string, clear roles
-        if not roles or not roles.strip():
-            self.db.modify(position_id, "roles_given", [])
-            embed = discord.Embed(
-                title="Roles Cleared",
-                description=f"All roles will be removed from application position '{position['name']}' (ID: {position_id}).",
-                colour=discord.Color.green()
-            )
-            await ctx.respond(embed=embed)
-            return
-
-        # Parse roles: accept mentions like <@&id>, plain numeric IDs, or role names
-        role_ids = []
-        tokens = [t.strip() for part in roles.split(',') for t in part.split() if t.strip()]
-        for token in tokens:
-            # mention format
-            if token.startswith('<@&') and token.endswith('>'):
-                try:
-                    rid = int(token[3:-1])
-                except ValueError:
-                    continue
-                role = ctx.guild.get_role(rid)
-                if role:
-                    role_ids.append(role.id)
-                continue
-
-            # numeric id
-            if token.isdigit():
-                rid = int(token)
-                role = ctx.guild.get_role(rid)
-                if role:
-                    role_ids.append(role.id)
-                continue
-
-            # try matching by name (case-insensitive)
-            role = discord.utils.find(lambda r: r.name.lower() == token.lower(), ctx.guild.roles)
-            if role:
-                role_ids.append(role.id)
-
-        if not role_ids:
-            embed = discord.Embed(
-                title="No Valid Roles Found",
-                description=("I couldn't resolve any of the provided roles to existing guild roles. "
-                             "Provide role mentions, IDs, or exact role names."),
-                colour=discord.Color.red()
-            )
-            await ctx.respond(embed=embed)
-            return
-
-        # Remove duplicates while preserving order
-        seen = set()
-        unique_role_ids = []
-        for rid in role_ids:
-            if rid not in seen:
-                seen.add(rid)
-                unique_role_ids.append(rid)
-
-        # Update DB
-        self.db.modify(position_id, "roles_given", unique_role_ids)
-
-        # Build success embed
-        role_mentions = ", ".join([f"<@&{r}>" for r in unique_role_ids])
-        embed = discord.Embed(
-            title="Roles Updated",
-            description=f"Roles to be given for application position '{position['name']}' (ID: {position_id}) have been updated.",
-            colour=discord.Color.green()
-        )
-        embed.add_field(name="Roles Set", value=role_mentions, inline=False)
-        await ctx.respond(embed=embed)
-
-    @perms_util.has_permission("manage_applications")
-    @appsmanage_commands.command(name="set_acceptance_message", description="Set the acceptance message for an application position.")
-    async def set_acceptance_message(self, ctx: discord.ApplicationContext, position_id: int, *, message: str):
-        """Set the acceptance message for an application position."""
-        position = self.db.get_position(position_id)
-        if not position:
-            embed = discord.Embed(
-                title="Position Not Found",
-                description=f"No application position found with ID {position_id}.",
-                colour=discord.Color.red()
-            )
-            await ctx.respond(embed=embed)
-            return
-
-        self.db.modify(position_id, "acceptance_message", message)
-        embed = discord.Embed(
-            title="Acceptance Message Updated",
-            description=f"Acceptance message for application position '{position['name']}' (ID: {position_id}) has been updated.",
-            colour=discord.Color.green()
-        )
-        await ctx.respond(embed=embed)
-
-    @perms_util.has_permission("manage_applications")
-    @appsmanage_commands.command(name="set_rejection_message", description="Set the rejection message for an application position.")
-    async def set_rejection_message(self, ctx: discord.ApplicationContext, position_id: int, *, message: str):
-        """Set the rejection message for an application position."""
-        position = self.db.get_position(position_id)
-        if not position:
-            embed = discord.Embed(
-                title="Position Not Found",
-                description=f"No application position found with ID {position_id}.",
-                colour=discord.Color.red()
-            )
-            await ctx.respond(embed=embed)
-            return
-
-        self.db.modify(position_id, "rejection_message", message)
-        embed = discord.Embed(
-            title="Rejection Message Updated",
-            description=f"Rejection message for application position '{position['name']}' (ID: {position_id}) has been updated.",
-            colour=discord.Color.green()
-        )
-        await ctx.respond(embed=embed)
 
     @perms_util.has_permission("manage_applications")
     @appsmanage_commands.command(name="approve", description="Approve an application, notify the applicant, and assign configured roles.")
